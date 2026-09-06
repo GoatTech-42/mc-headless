@@ -9,7 +9,7 @@ set -u
 
 HMC_HOME="${HMC_HOME:-/data}"
 GDIR="${MC_GDIR:-/data/.minecraft}"
-XMX="${JAVA_XMX:-1536M}"
+XMX="${MC_XMX:-1280M}" # own namespace — base image exports JAVA_XMX=1536M, which would override this default
 LOGIN_TIMEOUT="${HMC_LOGIN_TIMEOUT:-600}"
 # 1.18.2 -> 1.21.11 bump (2026-09-06): DonutSMP requires Minecraft >= 1.20.2.
 VER="fabric:1.21.11"
@@ -69,18 +69,66 @@ grep -q '^hmc.always.lwjgl.flag=' "$CONF" || echo 'hmc.always.lwjgl.flag=false' 
 log "enforced hmc.always.lwjgl.flag=false"
 
 # --- Pre-seed options.txt (lean rendering; unknown keys are ignored by MC) ---
+# CPU rationale: llvmpipe software rendering burns 150%+ CPU even idle. Cap the
+# software rasterizer (maxFps:10) + kill particle/shadows/AO/clouds so the render
+# thread does ~nothing. graphics:1 = fast, graphicsMode:0 = 1.21.x key (keep both;
+# unknown keys ignored by MC).
 OPTS="$GDIR/options.txt"
 if [ ! -f "$OPTS" ]; then
   cat > "$OPTS" <<EOF
 renderDistance:2
-graphics:fast
+graphics:1
+graphicsMode:0
+maxFps:10
+particles:0
+entityShadows:false
+ao:0
+renderClouds:false
+simulationDistance:3
+entityDistanceScaling:0.5
+mipmapLevels:0
+biomeBlendRadius:0
+enableVsync:false
+fullscreen:false
+bobView:false
+hudHidden:true
+masterVolume:0.0
+fov:70
 pauseOnLostFocus:false
 onboardAccessibility:false
 vsync:false
-fullscreen:false
 EOF
   log "wrote options.txt"
 fi
+# ENFORCE: rewrite each lean key on EVERY boot (user edits or an upgraded MC
+# writing defaults must not resurrect the CPU-hungry software renderer).
+set_opt() {
+  local k="$1" v="$2"
+  sed -i "s/^${k}:.*/${k}:${v}/" "$OPTS" || true
+  grep -q "^${k}:" "$OPTS" || echo "${k}:${v}" >> "$OPTS"
+}
+set_opt renderDistance 2
+set_opt graphics 1
+set_opt graphicsMode 0
+set_opt maxFps 10
+set_opt particles 0
+set_opt entityShadows false
+set_opt ao 0
+set_opt renderClouds false
+set_opt simulationDistance 3
+set_opt entityDistanceScaling 0.5
+set_opt mipmapLevels 0
+set_opt biomeBlendRadius 0
+set_opt enableVsync false
+set_opt fullscreen false
+set_opt bobView false
+set_opt hudHidden true
+set_opt masterVolume 0.0
+set_opt fov 70
+set_opt pauseOnLostFocus false
+set_opt onboardAccessibility false
+set_opt vsync false
+log "enforced lean options.txt (maxFps:10, simDistance:3, no particles/shadows/AO/clouds)"
 
 log "hmc home=$HMC_HOME gamedir=$GDIR xmx=$XMX jar=$HMC_JAR"
 
@@ -128,6 +176,12 @@ modrinth_dl "gvQqBUqZ" "lithium"
 modrinth_dl "uXXizFIs" "ferrite-core"
 modrinth_dl "fQEb0iXm" "krypton"
 modrinth_dl "hvFnDODi" "lazydfu"
+# Render-tick / RAM cutters for 1.21.11 (reduce llvmpipe render work when idle).
+modrinth_dl "NNAgCjsB" "entityculling" # EntityCulling
+modrinth_dl "cloth-config" "cloth-config" # Cloth Config (required dep of MoreCulling)
+modrinth_dl "51shyZVL" "moreculling"   # MoreCulling
+# Dropped mods (2026-09-06): c2me-fabric (c2me-opts-natives-math requires java >=25, we run 21);
+# modernfix/noisium/memoryleakfix/smoothboot/dashloader (no 1.21.11 fabric build on Modrinth).
 # hmc-specifics (msg/gui/click control) auto-download at launch via hmc.auto.download.specifics=true.
 
 # --- MineScript scripts: copy ALL user scripts baked into /app/scripts ---
@@ -198,7 +252,8 @@ if [ "${Xvfb:-}" = ":0" ]; then
   log "Xvfb=:0 set — using -lwjgl fallback (no display)"
 elif command -v Xvfb >/dev/null 2>&1; then
   export DISPLAY=:99
-  Xvfb "$DISPLAY" -screen 0 1280x720x24 >"$HMC_HOME/logs/xvfb.log" 2>&1 &
+  # 800x600x16: fewer pixels + 16bpp = less llvmpipe fill work (CPU render thread).
+  Xvfb "$DISPLAY" -screen 0 800x600x16 >"$HMC_HOME/logs/xvfb.log" 2>&1 &
   log "Xvfb started on $DISPLAY (software GL via llvmpipe)"
 else
   USE_XVFB=0
