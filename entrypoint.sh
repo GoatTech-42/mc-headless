@@ -180,6 +180,8 @@ modrinth_dl "hvFnDODi" "lazydfu"
 modrinth_dl "NNAgCjsB" "entityculling" # EntityCulling
 modrinth_dl "cloth-config" "cloth-config" # Cloth Config (required dep of MoreCulling)
 modrinth_dl "51shyZVL" "moreculling"   # MoreCulling
+# entity-render killer for farm AFK; config file reviewed post-boot (unknown schema until first run generates it).
+modrinth_dl "norender%2B" "NoRender+"
 # Dropped mods (2026-09-06): c2me-fabric (c2me-opts-natives-math requires java >=25, we run 21);
 # modernfix/noisium/memoryleakfix/smoothboot/dashloader (no 1.21.11 fabric build on Modrinth).
 # hmc-specifics (msg/gui/click control) auto-download at launch via hmc.auto.download.specifics=true.
