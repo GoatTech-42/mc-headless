@@ -37,13 +37,117 @@ app.use(express.json());
 const pub = path.join(__dirname, 'public');
 if (fs.existsSync(pub)) app.use(express.static(pub));
 
-// Bearer-token auth for mutating/sensitive API routes. Public: health, status, login-code.
-const PUBLIC_API = new Set(['/api/health', '/api/status', '/api/login-code']);
+// Password login with brute-force protection. Public: health, status,
+// login-code, auth-check, login/logout. Everything else under /api needs a
+// session cookie. DASH_TOKEN survives ONLY as the shared secret on the
+// pulse revival endpoints (service-to-service) - it no longer logs anyone in.
+const PASSWORD_HASH_FILE = path.join(DATA_DIR, 'dashboard-password.hash');
+const SESSIONS_FILE = path.join(DATA_DIR, 'dashboard-sessions.json');
+const LOGIN_GUARD_FILE = path.join(DATA_DIR, 'dashboard-login-guard.json');
+const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
+const MAX_LOGIN_FAILS = 5;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+
+function hashDashboardPassword(pw) {
+  const salt = require('crypto').randomBytes(16).toString('hex');
+  return `${salt}$${require('crypto').scryptSync(pw, salt, 32).toString('hex')}`;
+}
+function loadPasswordHash() {
+  try {
+    const t = fs.readFileSync(PASSWORD_HASH_FILE, 'utf8').trim();
+    if (/^[0-9a-f]{32}\$[0-9a-f]{64}$/.test(t)) return t;
+  } catch {}
+  // One-time seed from env (set it, restart, unset it). Never logged.
+  const pw = process.env.DASHBOARD_PASSWORD || '';
+  if (pw.length >= 4) {
+    const h = hashDashboardPassword(pw);
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(PASSWORD_HASH_FILE, h + '\n', { mode: 0o600 });
+      console.log('dashboard password hash seeded at ' + PASSWORD_HASH_FILE);
+      return h;
+    } catch (e) { console.error('password seed failed', e); }
+  }
+  console.error('dashboard password NOT set - set DASHBOARD_PASSWORD once or write ' + PASSWORD_HASH_FILE);
+  return '';
+}
+function verifyDashboardPassword(pw, stored) {
+  const parts = (stored || '').split('$');
+  if (parts.length !== 2 || !pw) return false;
+  const cand = require('crypto').scryptSync(pw, parts[0], 32);
+  const want = Buffer.from(parts[1], 'hex');
+  return cand.length === want.length && require('crypto').timingSafeEqual(cand, want);
+}
+const DASH_PASSWORD_HASH = loadPasswordHash();
+
+function readJsonFile(p, dflt) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return dflt; } }
+function writeJsonFile(p, v) { try { fs.writeFileSync(p, JSON.stringify(v), { mode: 0o600 }); } catch (e) { console.error(e); } }
+function clientIp(req) {
+  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+}
+function sessionTokenFrom(req) {
+  const m = /(?:^|;\s*)mch_session=([0-9a-f]{64})/.exec(req.headers.cookie || '');
+  if (!m) return null;
+  const sessions = readJsonFile(SESSIONS_FILE, {});
+  const exp = sessions[m[1]];
+  if (!exp) return null;
+  if (Date.now() > exp) { delete sessions[m[1]]; writeJsonFile(SESSIONS_FILE, sessions); return null; }
+  return m[1];
+}
+
+const PUBLIC_API = new Set(['/api/health', '/api/status', '/api/login-code', '/api/auth-check']);
+
+app.post('/api/login', async (req, res) => {
+  const ip = clientIp(req);
+  const guard = readJsonFile(LOGIN_GUARD_FILE, {});
+  const g = guard[ip] || { fails: 0, locked_until: 0 };
+  const now = Date.now();
+  if (g.locked_until && now < g.locked_until) {
+    return res.status(429).json({ error: 'locked out', retry_after_sec: Math.ceil((g.locked_until - now) / 1000) });
+  }
+  const pw = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!DASH_PASSWORD_HASH || !verifyDashboardPassword(pw, DASH_PASSWORD_HASH)) {
+    await new Promise((r) => setTimeout(r, 800 + Math.floor(Math.random() * 700))); // slow + timing de-jitter
+    g.fails = (g.fails || 0) + 1;
+    if (g.fails >= MAX_LOGIN_FAILS) {
+      g.locked_until = now + LOGIN_LOCKOUT_MS;
+      g.fails = 0;
+      console.warn(`dashboard login: ${ip} LOCKED OUT for 15m after ${MAX_LOGIN_FAILS} failed attempts`);
+    } else {
+      console.warn(`dashboard login: failed attempt ${g.fails}/${MAX_LOGIN_FAILS} from ${ip}`);
+    }
+    guard[ip] = g;
+    writeJsonFile(LOGIN_GUARD_FILE, guard);
+    return bad(res, 401, 'wrong password');
+  }
+  delete guard[ip];
+  writeJsonFile(LOGIN_GUARD_FILE, guard);
+  const token = require('crypto').randomBytes(32).toString('hex');
+  const sessions = readJsonFile(SESSIONS_FILE, {});
+  for (const [t, exp] of Object.entries(sessions)) if (now > exp) delete sessions[t];
+  sessions[token] = now + SESSION_TTL_MS;
+  writeJsonFile(SESSIONS_FILE, sessions);
+  res.setHeader('Set-Cookie', `mch_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
+  console.log(`dashboard login: ${ip} logged in`);
+  res.json({ ok: true });
+});
+
+app.post('/api/logout', (req, res) => {
+  const tok = sessionTokenFrom(req);
+  if (tok) { const s = readJsonFile(SESSIONS_FILE, {}); delete s[tok]; writeJsonFile(SESSIONS_FILE, s); }
+  res.setHeader('Set-Cookie', 'mch_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+  res.json({ ok: true });
+});
+
+app.get('/api/auth-check', (req, res) => res.json({ authed: !!sessionTokenFrom(req) }));
+
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next();
   if (req.method === 'GET' && PUBLIC_API.has(req.path)) return next();
-  const h = req.headers.authorization || '';
-  if (DASH_TOKEN && h === `Bearer ${DASH_TOKEN}`) return next();
+  if (req.path === '/api/login' || req.path === '/api/logout') return next();
+  if (sessionTokenFrom(req)) return next();
+  // service-to-service only: pulse's revival trigger uses the shared token
+  if (req.path === '/api/revive-key' && DASH_TOKEN && (req.headers.authorization || '') === `Bearer ${DASH_TOKEN}`) return next();
   bad(res, 401, 'auth required');
 });
 

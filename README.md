@@ -45,3 +45,33 @@ curl http://localhost:4202/api/login-code
 - Start afk: enables autorun each join (ends on disconnect).
 - Telemetry: needs `\telemetry` autorun (preconfigured).
 - Chat-send via dashboard: unreliable on 1.21 (signed chat) — use autorun scripts instead.
+
+## Dashboard authentication
+
+Password login (session cookie, 30 days). Brute-force protection: 5 wrong
+attempts from one IP locks that IP out for 15 minutes (429 + `retry_after_sec`);
+guard state persists across restarts, and every failure/lockout/login hits the
+container log.
+
+- Set or change the password: put it in the container env once
+  (`DASHBOARD_PASSWORD=...`), restart the sidecar - a scrypt hash is written to
+  `/app/data/dashboard-password.hash` - then remove the env var. The plaintext
+  is never stored.
+- Public endpoints (no login): `GET /api/health`, `GET /api/status`,
+  `GET /api/login-code`, `GET /api/auth-check`, `POST /api/login`,
+  `POST /api/logout`. Everything else needs the session cookie.
+- `POST /api/revive-key` additionally accepts the shared service token
+  (`/app/data/dashboard-token`, bearer) so pulse can trigger key revival
+  machine-to-machine. That token no longer logs into the dashboard UI.
+
+## DonutSMP API key auto-revival
+
+When pulse's DonutSMP key dies it POSTs `/api/revive-key` here. The sidecar
+writes a request file, arms the `apikey.py` MineScript autorun, waits a random
+20-90s like a person coming back to the keyboard, reconnects to DonutSMP, and
+the in-game script idles human-plausibly before running `/api` and writing the
+captured key to a result file. The sidecar then POSTs the key to pulse's
+callback and disarms the autorun. Cooldowns: 4h after a successful capture,
+30min after a failure. `GET /api/revive-key` shows state. Anti-ban notes: no
+instant login->command->quit, random delays everywhere, the client stays
+online after capturing.

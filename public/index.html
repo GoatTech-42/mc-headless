@@ -272,24 +272,57 @@ function toast(msg, ok) {
 }
 
 
-function ensureToken() {
-  if (!localStorage.getItem('mcDashToken')) {
-    const t = window.prompt('Dashboard token:');
-    if (t) localStorage.setItem('mcDashToken', t.trim());
-  }
-}
-function apiFetch(url, opts) {
-  opts = opts || {};
-  const h = Object.assign({}, opts.headers);
-  const t = localStorage.getItem('mcDashToken') || '';
-  if (t) h['Authorization'] = 'Bearer ' + t;
-  opts.headers = h;
-  return fetch(url, opts).then((r) => {
-    if (r.status === 401) { localStorage.removeItem('mcDashToken'); ensureToken(); }
-    return r;
+// --- session login (cookie-based, brute-force protected server-side) ---
+let loginOverlay = null;
+function showLogin() {
+  if (loginOverlay) return loginOverlay.promise;
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:fixed;inset:0;background:rgba(10,10,16,.82);display:flex;align-items:center;justify-content:center;z-index:9999;backdrop-filter:blur(4px)';
+  wrap.innerHTML = `
+    <form style="background:#181824;border:1px solid #2a2a3a;border-radius:14px;padding:28px;width:320px;display:flex;flex-direction:column;gap:12px;box-shadow:0 18px 60px rgba(0,0,0,.5)">
+      <div style="font-size:18px;font-weight:700;color:#fff;text-align:center">MiniGoat Headless</div>
+      <div style="font-size:12px;color:#9a9ab0;text-align:center">Dashboard password required</div>
+      <input type="password" placeholder="Password" autocomplete="current-password" style="background:#101018;border:1px solid #33334a;border-radius:8px;padding:10px 12px;color:#fff;font-size:14px;outline:none" />
+      <div class="err" style="color:#ff6b6b;font-size:12px;min-height:14px;text-align:center"></div>
+      <button type="submit" style="background:#5b5bf0;border:0;border-radius:8px;padding:10px;color:#fff;font-weight:600;cursor:pointer">Log in</button>
+    </form>`;
+  const input = wrap.querySelector('input');
+  const err = wrap.querySelector('.err');
+  const box = {};
+  loginOverlay = box;
+  box.promise = new Promise((resolve) => {
+    wrap.querySelector('form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      err.textContent = '';
+      try {
+        const r = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: input.value })
+        });
+        if (r.ok) { wrap.remove(); loginOverlay = null; return resolve(true); }
+        const d = await r.json().catch(() => ({}));
+        if (r.status === 429) err.textContent = 'Locked out - try again in ' + Math.ceil((d.retry_after_sec || 900) / 60) + ' min';
+        else err.textContent = 'Wrong password';
+      } catch { err.textContent = 'Network error'; }
+      input.value = '';
+      input.focus();
+    });
   });
+  document.body.appendChild(wrap);
+  input.focus();
+  return box.promise;
 }
-ensureToken();
+async function apiFetch(url, opts) {
+  let r = await fetch(url, opts);
+  if (r.status !== 401) return r;
+  const ok = await showLogin();
+  if (!ok) return r;
+  r = await fetch(url, opts);
+  return r;
+}
+// Prompt up front if the session is gone.
+fetch('/api/auth-check').then(r => r.json()).then(d => { if (!d.authed) showLogin(); }).catch(() => {});
 
 async function post(url, body) {
   const r = await apiFetch(url, {
