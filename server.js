@@ -13,12 +13,39 @@ const LOGIN_DONE = path.join(HMC_HOME, 'logs', '.login-done');
 const SERVER_TARGET = path.join(HMC_HOME, 'server.target');
 const HMC_CMD = path.join(HMC_HOME, 'hmc-cmd.log');
 
+const DATA_DIR = process.env.DASH_DATA || '/app/data';
+const TOKEN_FILE = path.join(DATA_DIR, 'dashboard-token');
+function loadDashToken() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (fs.existsSync(TOKEN_FILE)) {
+      const t = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+      if (t.length >= 16) return t;
+    }
+    const t = require('crypto').randomBytes(24).toString('hex');
+    fs.writeFileSync(TOKEN_FILE, t + '\n', { mode: 0o600 });
+    console.log('dashboard token generated at ' + TOKEN_FILE);
+    return t;
+  } catch (e) { console.error('token load failed', e); return ''; }
+}
+const DASH_TOKEN = loadDashToken();
+
 const app = express();
 app.use(express.json());
 
 // Static frontend (dir may not exist yet).
 const pub = path.join(__dirname, 'public');
 if (fs.existsSync(pub)) app.use(express.static(pub));
+
+// Bearer-token auth for mutating/sensitive API routes. Public: health, status, login-code.
+const PUBLIC_API = new Set(['/api/health', '/api/status', '/api/login-code']);
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  if (req.method === 'GET' && PUBLIC_API.has(req.path)) return next();
+  const h = req.headers.authorization || '';
+  if (DASH_TOKEN && h === `Bearer ${DASH_TOKEN}`) return next();
+  bad(res, 401, 'auth required');
+});
 
 // --- helpers ---
 function tail(file, lines = 200) {
@@ -270,6 +297,132 @@ app.get('/api/telemetry', (_req, res) => {
     console.error(e);
     bad(res, 500, 'Failed to parse telemetry');
   }
+});
+
+
+// --- DonutSMP API key revival (pulse self-heal loop) ---
+const REVIVE_STATE_FILE = path.join(DATA_DIR, 'revive-state.json');
+const MS_DIR = path.join(GDIR, 'minescript');
+const APIKEY_REQ = path.join(MS_DIR, 'apikey_request.json');
+const APIKEY_RES = path.join(MS_DIR, 'apikey_result.json');
+const APIKEY_AUTORUN = 'autorun[*]=\\apikey';
+const REVIVE_COOLDOWN_OK_MS = 4 * 3600 * 1000;   // after a successful capture
+const REVIVE_COOLDOWN_FAIL_MS = 30 * 60 * 1000;  // after a failed attempt
+const REVIVE_TIMEOUT_MS = 20 * 60 * 1000;
+
+function readJsonSafe(p, dflt) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return dflt; }
+}
+function writeReviveState(s) {
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(REVIVE_STATE_FILE, JSON.stringify(s)); } catch (e) { console.error(e); }
+}
+function reviveState() { return readJsonSafe(REVIVE_STATE_FILE, { in_progress: false }); }
+
+function ensureApikeyAutorun(on) {
+  const cfgPath = path.join(MS_DIR, 'config.txt');
+  let txt = '';
+  try { txt = fs.readFileSync(cfgPath, 'utf8'); } catch {}
+  const has = txt.split('\n').includes(APIKEY_AUTORUN);
+  if (on && !has) {
+    const sep = txt && !txt.endsWith('\n') ? '\n' : '';
+    fs.writeFileSync(cfgPath, txt + sep + APIKEY_AUTORUN + '\n');
+  } else if (!on && has) {
+    fs.writeFileSync(cfgPath, txt.split('\n').filter((l) => l !== APIKEY_AUTORUN).join('\n'));
+  }
+}
+
+function postCallback(url, payload, attempt) {
+  const body = JSON.stringify(payload);
+  const u = new URL(url);
+  const mod = u.protocol === 'https:' ? require('https') : require('http');
+  const creq = mod.request({
+    method: 'POST', hostname: u.hostname, port: u.port, path: u.pathname + u.search,
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Authorization': `Bearer ${DASH_TOKEN}` },
+    timeout: 10000,
+  }, (cres) => {
+    console.log(`revive callback -> ${cres.statusCode} (attempt ${attempt})`);
+    cres.resume();
+    if (cres.statusCode >= 400 && attempt < 4) setTimeout(() => postCallback(url, payload, attempt + 1), 15000 * attempt);
+  });
+  creq.on('error', (e) => {
+    console.error('revive callback error', e.message);
+    if (attempt < 4) setTimeout(() => postCallback(url, payload, attempt + 1), 15000 * attempt);
+  });
+  creq.on('timeout', () => creq.destroy(new Error('timeout')));
+  creq.write(body);
+  creq.end();
+}
+
+let revivePoller = null;
+function watchReviveResult(id, callbackUrl, startedAt) {
+  if (revivePoller) clearInterval(revivePoller);
+  revivePoller = setInterval(() => {
+    const st = reviveState();
+    if (!st.in_progress || st.id !== id) { clearInterval(revivePoller); revivePoller = null; return; }
+    if (Date.now() - startedAt > REVIVE_TIMEOUT_MS) {
+      clearInterval(revivePoller); revivePoller = null;
+      ensureApikeyAutorun(false);
+      writeReviveState({ ...st, in_progress: false, finished_at: Date.now(), last_result: { status: 'error', error: 'timeout waiting for in-game capture' } });
+      postCallback(callbackUrl, { status: 'error', error: 'timeout waiting for in-game capture' }, 1);
+      return;
+    }
+    const out = readJsonSafe(APIKEY_RES, null);
+    if (!out || out.id !== id) return;
+    clearInterval(revivePoller); revivePoller = null;
+    ensureApikeyAutorun(false);
+    try { fs.unlinkSync(APIKEY_RES); } catch {}
+    writeReviveState({ ...st, in_progress: false, finished_at: Date.now(), last_result: { status: out.status, error: out.error || null, chat_tail: (out.chat || []).slice(-8) } });
+    postCallback(callbackUrl, { status: out.status, key: out.key || null, error: out.error || null }, 1);
+  }, 5000);
+}
+
+app.get('/api/revive-key', (_req, res) => {
+  const st = reviveState();
+  res.json({
+    in_progress: !!st.in_progress,
+    id: st.id || null,
+    requested_at: st.requested_at || null,
+    last_attempt_at: st.last_attempt_at || null,
+    last_result: st.last_result || null,
+    cooldown_ok_ms: REVIVE_COOLDOWN_OK_MS,
+    cooldown_fail_ms: REVIVE_COOLDOWN_FAIL_MS,
+  });
+});
+
+app.post('/api/revive-key', (req, res) => {
+  const callbackUrl = typeof req.body?.callback_url === 'string' ? req.body.callback_url.trim() : '';
+  let u;
+  try { u = new URL(callbackUrl); } catch { return bad(res, 400, 'callback_url required'); }
+  if (u.protocol !== 'http:' || !/^(172\.17\.0\.1|127\.0\.0\.1|localhost)$/.test(u.hostname))
+    return bad(res, 400, 'callback_url must be internal');
+  const st = reviveState();
+  if (st.in_progress) return res.status(409).json({ error: 'revival already in progress', id: st.id });
+  const now = Date.now();
+  const cooldown = st.last_result && st.last_result.status === 'ok' ? REVIVE_COOLDOWN_OK_MS : REVIVE_COOLDOWN_FAIL_MS;
+  if (st.last_attempt_at && now - st.last_attempt_at < cooldown)
+    return res.status(429).json({ error: 'cooldown', retry_after_sec: Math.ceil((cooldown - (now - st.last_attempt_at)) / 1000) });
+  if (!fs.existsSync(path.join(MS_DIR, 'apikey.py')))
+    return bad(res, 500, 'apikey.py not installed');
+
+  const id = require('crypto').randomBytes(8).toString('hex');
+  try { fs.unlinkSync(APIKEY_RES); } catch {}
+  try {
+    fs.writeFileSync(APIKEY_REQ, JSON.stringify({ id, requested_at: Math.floor(now / 1000) }));
+  } catch (e) { console.error(e); return bad(res, 500, 'failed to write request file'); }
+  ensureApikeyAutorun(true);
+  writeReviveState({ in_progress: true, id, requested_at: now, last_attempt_at: now, callback_url: callbackUrl });
+
+  // Human-plausible reconnect: wait a bit like a person coming back, then rejoin.
+  const { host, port, target } = readTarget();
+  const preDelay = 20000 + Math.floor(Math.random() * 70000);
+  appendCmd(`revive-key ${id} -> reconnect ${target} in ${Math.round(preDelay / 1000)}s`);
+  setTimeout(() => {
+    hmc('disconnect');
+    setTimeout(() => hmc(`connect ${host} ${port}`), 8000 + Math.floor(Math.random() * 7000));
+  }, preDelay);
+
+  watchReviveResult(id, callbackUrl, now);
+  res.status(202).json({ ok: true, id, target, eta_sec: Math.round(preDelay / 1000) + 300 });
 });
 
 // 404 + error handler
