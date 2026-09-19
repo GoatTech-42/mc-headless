@@ -256,6 +256,7 @@ if [ "${Xvfb:-}" = ":0" ]; then
 elif command -v Xvfb >/dev/null 2>&1; then
   export DISPLAY=:99
   # 800x600x16: fewer pixels + 16bpp = less llvmpipe fill work (CPU render thread).
+  rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
   Xvfb "$DISPLAY" -screen 0 800x600x16 >"$HMC_HOME/logs/xvfb.log" 2>&1 &
   log "Xvfb started on $DISPLAY (software GL via llvmpipe)"
 else
@@ -288,7 +289,7 @@ while true; do
   log "launch attempt $attempt $VER ..."
   # Feed hmc-cmd.log into the launcher's stdin. tail stays open forever; the pipeline's
   # exit status is java's (last command in the pipe), so crash detection is unchanged.
-  if tail -n0 -f "$HMC_HOME/hmc-cmd.log" 2>/dev/null | java -jar "$HMC_JAR" --command launch "$VER" $LWJGL_FLAG --jvm "-Xmx$XMX -XX:+UseG1GC -XX:MaxGCPauseMillis=50" $EXTRA_ARGS; then
+  if tail -n0 -f "$HMC_HOME/hmc-cmd.log" 2>/dev/null | java -jar "$HMC_JAR" --command launch "$VER" $LWJGL_FLAG --jvm "-Xmx$XMX -XX:+UseG1GC -XX:MaxGCPauseMillis=50" -- $EXTRA_ARGS; then
     log "game exited cleanly (code $?)"
   else
     log "launch failed (code $?) — retry in 60s, dashboard stays up"
