@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+MC_GAME_VERSION="${MC_GAME_VERSION:-26.3}"
 # mc-headless entrypoint — HeadlessMC fabric:1.21.11 (headless) + MineScript + dashboard sidecar.
 #
 # HeadlessMC home = /data (launcher runs with CWD=/data). Game dir = /data/.minecraft. Logs -> /data/logs.
@@ -11,8 +12,8 @@ HMC_HOME="${HMC_HOME:-/data}"
 GDIR="${MC_GDIR:-/data/.minecraft}"
 XMX="${MC_XMX:-1280M}" # own namespace — base image exports JAVA_XMX=1536M, which would override this default
 LOGIN_TIMEOUT="${HMC_LOGIN_TIMEOUT:-600}"
-# 1.18.2 -> 1.21.11 bump (2026-09-06): DonutSMP requires Minecraft >= 1.20.2.
-VER="fabric:1.21.11"
+# 1.21.11 -> 26.3 bump (2026-09-19): Emberstead staging Pumpkin nightly = protocol 777 (MC 26.3).
+VER="fabric:26.3"
 
 # Locate the HeadlessMC wrapper jar (base image drops it in /headlessmc).
 # Exact name first, then versioned glob. `tr -d '\r'` guards against CRLF line
@@ -147,7 +148,7 @@ fi
 modrinth_dl() {
   local slug="${1:-}" label="${2:-}"
   local json url filename
-  json="$(curl -fsSL "https://api.modrinth.com/v2/project/${slug}/version?game_versions=%5B%221.21.11%22%5D&loaders=%5B%22fabric%22%5D&limit=1" 2>/dev/null || true)"
+  json="$(curl -fsSL "https://api.modrinth.com/v2/project/${slug}/version?game_versions=%5B%22${MC_GAME_VERSION}%22%5D&loaders=%5B%22fabric%22%5D&limit=1" 2>/dev/null || true)"
   if [ -z "$json" ]; then
     log "WARN: resolve failed for $label ($slug) — continuing"
     return 0
