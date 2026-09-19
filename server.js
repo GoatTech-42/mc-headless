@@ -35,7 +35,7 @@ app.use(express.json());
 
 // Static frontend (dir may not exist yet).
 const pub = path.join(__dirname, 'public');
-if (fs.existsSync(pub)) app.use(express.static(pub));
+if (fs.existsSync(pub)) app.use((req,res,next)=>{ if(req.path==='/'||req.path.endsWith('.html')) res.setHeader('Cache-Control','no-store'); next(); }, express.static(pub));
 
 // Password login with brute-force protection. Public: health, status,
 // login-code, auth-check, login/logout. Everything else under /api needs a
