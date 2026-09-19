@@ -139,12 +139,24 @@ app.post('/api/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+
+// One-time password setup: only works while NO hash file exists (self-disabling).
+app.post("/api/setup", (req, res) => {
+  try { fs.accessSync(PASSWORD_HASH_FILE); return bad(res, 403, "already configured"); } catch {}
+  const pw = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!pw) return bad(res, 400, "empty password");
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(PASSWORD_HASH_FILE, hashDashboardPassword(pw) + "\n", { mode: 0o600 });
+  console.log("dashboard password set via /api/setup");
+  res.json({ ok: true });
+});
+
 app.get('/api/auth-check', (req, res) => res.json({ authed: !!sessionTokenFrom(req) }));
 
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next();
   if (req.method === 'GET' && PUBLIC_API.has(req.path)) return next();
-  if (req.path === '/api/login' || req.path === '/api/logout') return next();
+  if (req.path === '/api/login' || req.path === '/api/logout' || req.path === '/api/setup') return next();
   if (sessionTokenFrom(req)) return next();
   // service-to-service only: pulse's revival trigger uses the shared token
   if (req.path === '/api/revive-key' && DASH_TOKEN && (req.headers.authorization || '') === `Bearer ${DASH_TOKEN}`) return next();
