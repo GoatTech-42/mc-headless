@@ -274,7 +274,7 @@ function toast(msg, ok) {
 
 // --- session login (cookie-based, brute-force protected server-side) ---
 let loginOverlay = null;
-function showLogin() {
+function showPasswordLogin() {
   if (loginOverlay) return loginOverlay.promise;
   const wrap = document.createElement('div');
   wrap.style.cssText = 'position:fixed;inset:0;background:rgba(10,10,16,.82);display:flex;align-items:center;justify-content:center;z-index:9999;backdrop-filter:blur(4px)';
@@ -316,13 +316,13 @@ function showLogin() {
 async function apiFetch(url, opts) {
   let r = await fetch(url, opts);
   if (r.status !== 401) return r;
-  const ok = await showLogin();
+  const ok = await showPasswordLogin();
   if (!ok) return r;
   r = await fetch(url, opts);
   return r;
 }
 // Prompt up front if the session is gone.
-fetch('/api/auth-check').then(r => r.json()).then(d => { if (!d.authed) showLogin(); }).catch(() => {});
+fetch('/api/auth-check').then(r => r.json()).then(d => { if (!d.authed) showPasswordLogin(); }).catch(() => {});
 
 async function post(url, body) {
   const r = await apiFetch(url, {
