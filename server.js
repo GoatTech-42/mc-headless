@@ -78,7 +78,7 @@ function verifyDashboardPassword(pw, stored) {
   const want = Buffer.from(parts[1], 'hex');
   return cand.length === want.length && require('crypto').timingSafeEqual(cand, want);
 }
-const DASH_PASSWORD_HASH = loadPasswordHash();
+let DASH_PASSWORD_HASH = loadPasswordHash();
 
 function readJsonFile(p, dflt) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return dflt; } }
 function writeJsonFile(p, v) { try { fs.writeFileSync(p, JSON.stringify(v), { mode: 0o600 }); } catch (e) { console.error(e); } }
@@ -140,18 +140,31 @@ app.post('/api/logout', (req, res) => {
 });
 
 
-// One-time password setup: only works while NO hash file exists (self-disabling).
-app.post("/api/setup", (req, res) => {
-  try { fs.accessSync(PASSWORD_HASH_FILE); return bad(res, 403, "already configured"); } catch {}
-  const pw = typeof req.body?.password === "string" ? req.body.password : "";
-  if (!pw) return bad(res, 400, "empty password");
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(PASSWORD_HASH_FILE, hashDashboardPassword(pw) + "\n", { mode: 0o600 });
-  console.log("dashboard password set via /api/setup");
-  res.json({ ok: true });
+// First-run setup only. Keep a fresh instance private until it is configured.
+app.post('/api/setup', (req, res) => {
+  if (DASH_PASSWORD_HASH || fs.existsSync(PASSWORD_HASH_FILE))
+    return bad(res, 403, 'already configured');
+  const pw = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (pw.length < 12 || pw.length > 256)
+    return bad(res, 400, 'Use a password between 12 and 256 characters');
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const hash = hashDashboardPassword(pw);
+    fs.writeFileSync(PASSWORD_HASH_FILE, hash + '\n', { mode: 0o600, flag: 'wx' });
+    DASH_PASSWORD_HASH = hash;
+    console.log('dashboard password configured');
+    res.json({ ok: true });
+  } catch (e) {
+    if (e.code === 'EEXIST') return bad(res, 403, 'already configured');
+    console.error('dashboard setup failed', e.code);
+    bad(res, 500, 'Could not save password');
+  }
 });
 
-app.get('/api/auth-check', (req, res) => res.json({ authed: !!sessionTokenFrom(req) }));
+app.get('/api/auth-check', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ authed: !!sessionTokenFrom(req), configured: !!DASH_PASSWORD_HASH });
+});
 
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next();
