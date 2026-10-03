@@ -274,17 +274,30 @@ function toast(msg, ok) {
 
 // --- session login (cookie-based, brute-force protected server-side) ---
 let loginOverlay = null;
-function showPasswordLogin() {
+async function showPasswordLogin() {
+  if (loginOverlay) return loginOverlay.promise;
+  let setup = false;
+  try {
+    const r = await fetch('/api/auth-check', { cache: 'no-store' });
+    if (!r.ok) throw new Error('auth check failed');
+    const state = await r.json();
+    if (state.authed) return true;
+    setup = state.configured === false;
+  } catch {
+    toast('Could not check dashboard login. Reload to try again.');
+    return false;
+  }
   if (loginOverlay) return loginOverlay.promise;
   const wrap = document.createElement('div');
   wrap.style.cssText = 'position:fixed;inset:0;background:rgba(10,10,16,.82);display:flex;align-items:center;justify-content:center;z-index:9999;backdrop-filter:blur(4px)';
   wrap.innerHTML = `
-    <form style="background:#181824;border:1px solid #2a2a3a;border-radius:14px;padding:28px;width:320px;display:flex;flex-direction:column;gap:12px;box-shadow:0 18px 60px rgba(0,0,0,.5)">
+    <form style="background:#181824;border:1px solid #2a2a3a;border-radius:14px;padding:28px;width:min(320px,calc(100vw - 32px));box-sizing:border-box;display:flex;flex-direction:column;gap:12px;box-shadow:0 18px 60px rgba(0,0,0,.5)">
       <div style="font-size:18px;font-weight:700;color:#fff;text-align:center">MiniGoat Headless</div>
-      <div style="font-size:12px;color:#9a9ab0;text-align:center">Dashboard password required</div>
-      <input type="password" placeholder="Password" autocomplete="current-password" style="background:#101018;border:1px solid #33334a;border-radius:8px;padding:10px 12px;color:#fff;font-size:14px;outline:none" />
+      <div style="font-size:12px;color:#9a9ab0;text-align:center">${setup ? 'Create a password for this instance. Keep it private until setup is done.' : 'Dashboard password required'}</div>
+      <input type="password" placeholder="Password" autocomplete="${setup ? 'new-password' : 'current-password'}" ${setup ? 'minlength="12" maxlength="256"' : ''} required style="background:#101018;border:1px solid #33334a;border-radius:8px;padding:10px 12px;color:#fff;font-size:14px;outline:none" />
+      ${setup ? '<input type="password" placeholder="Confirm password" autocomplete="new-password" required style="background:#101018;border:1px solid #33334a;border-radius:8px;padding:10px 12px;color:#fff;font-size:14px" />' : ''}
       <div class="err" style="color:#ff6b6b;font-size:12px;min-height:14px;text-align:center"></div>
-      <button type="submit" style="background:#5b5bf0;border:0;border-radius:8px;padding:10px;color:#fff;font-weight:600;cursor:pointer">Log in</button>
+      <button type="submit" style="background:#5b5bf0;border:0;border-radius:8px;padding:10px;color:#fff;font-weight:600;cursor:pointer">${setup ? 'Create password' : 'Log in'}</button>
     </form>`;
   const input = wrap.querySelector('input');
   const err = wrap.querySelector('.err');
@@ -295,6 +308,26 @@ function showPasswordLogin() {
       e.preventDefault();
       err.textContent = '';
       try {
+        if (setup) {
+          if (input.value !== wrap.querySelectorAll('input')[1].value) {
+            err.textContent = 'Passwords do not match';
+            return;
+          }
+          const created = await fetch('/api/setup', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: input.value })
+          });
+          if (!created.ok) {
+            const d = await created.json().catch(() => ({}));
+            err.textContent = d.error || 'Could not create password';
+            if (created.status === 403) err.textContent = 'Already configured. Reload and log in.';
+            return;
+          }
+          setup = false;
+          wrap.querySelectorAll('input')[1].remove();
+          input.autocomplete = 'current-password';
+          wrap.querySelector('button').textContent = 'Log in';
+        }
         const r = await fetch('/api/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
