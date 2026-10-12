@@ -59,7 +59,7 @@ function loadPasswordHash() {
   } catch {}
   // One-time seed from env (set it, restart, unset it). Never logged.
   const pw = process.env.DASHBOARD_PASSWORD || '';
-  if (pw.length >= 4) {
+  if (pw.length >= 8) {
     const h = hashDashboardPassword(pw);
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -83,7 +83,12 @@ let DASH_PASSWORD_HASH = loadPasswordHash();
 function readJsonFile(p, dflt) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return dflt; } }
 function writeJsonFile(p, v) { try { fs.writeFileSync(p, JSON.stringify(v), { mode: 0o600 }); } catch (e) { console.error(e); } }
 function clientIp(req) {
-  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+  // Behind Cloudflare: CF-Connecting-IP is set by the edge; otherwise use the LAST xff hop
+  // (the one our own proxy appended), never the client-controlled first entry.
+  const cf = (req.headers['cf-connecting-ip'] || '').trim();
+  if (cf) return cf;
+  const hops = (req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+  return hops[hops.length - 1] || req.socket.remoteAddress || 'unknown';
 }
 function sessionTokenFrom(req) {
   const m = /(?:^|;\s*)mch_session=([0-9a-f]{64})/.exec(req.headers.cookie || '');
@@ -95,39 +100,42 @@ function sessionTokenFrom(req) {
   return m[1];
 }
 
-const PUBLIC_API = new Set(['/api/health', '/api/status', '/api/login-code', '/api/auth-check']);
+function safeEq(a, b) { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && require('crypto').timingSafeEqual(x, y); }
+const PUBLIC_API = new Set(['/api/health', '/api/status', '/api/auth-check']);
 
 app.post('/api/login', async (req, res) => {
   const ip = clientIp(req);
-  const guard = readJsonFile(LOGIN_GUARD_FILE, {});
-  const g = guard[ip] || { fails: 0, locked_until: 0 };
   const now = Date.now();
+  const guard = readJsonFile(LOGIN_GUARD_FILE, {});
+  for (const [k, v] of Object.entries(guard)) if (!v || (v.locked_until || 0) < now - LOGIN_LOCKOUT_MS) { if (!v || !v.fails) delete guard[k]; }
+  const g = guard[ip] || { fails: 0, locked_until: 0 };
   if (g.locked_until && now < g.locked_until) {
     return res.status(429).json({ error: 'locked out', retry_after_sec: Math.ceil((g.locked_until - now) / 1000) });
   }
+  // Reserve the attempt BEFORE verifying (no await between read and write), so parallel
+  // guesses cannot all pass the lock check. Success clears it.
+  g.fails = (g.fails || 0) + 1;
+  if (g.fails >= MAX_LOGIN_FAILS) { g.locked_until = now + LOGIN_LOCKOUT_MS; g.fails = 0; console.warn(`dashboard login: ${ip} LOCKED OUT for 15m`); }
+  guard[ip] = g;
+  const keys = Object.keys(guard);
+  if (keys.length > 500) for (const k of keys.slice(0, keys.length - 500)) delete guard[k];
+  writeJsonFile(LOGIN_GUARD_FILE, guard);
   const pw = typeof req.body?.password === 'string' ? req.body.password : '';
-  if (!DASH_PASSWORD_HASH || !verifyDashboardPassword(pw, DASH_PASSWORD_HASH)) {
-    await new Promise((r) => setTimeout(r, 800 + Math.floor(Math.random() * 700))); // slow + timing de-jitter
-    g.fails = (g.fails || 0) + 1;
-    if (g.fails >= MAX_LOGIN_FAILS) {
-      g.locked_until = now + LOGIN_LOCKOUT_MS;
-      g.fails = 0;
-      console.warn(`dashboard login: ${ip} LOCKED OUT for 15m after ${MAX_LOGIN_FAILS} failed attempts`);
-    } else {
-      console.warn(`dashboard login: failed attempt ${g.fails}/${MAX_LOGIN_FAILS} from ${ip}`);
-    }
-    guard[ip] = g;
-    writeJsonFile(LOGIN_GUARD_FILE, guard);
+  const okPw = !!DASH_PASSWORD_HASH && verifyDashboardPassword(pw, DASH_PASSWORD_HASH);
+  if (!okPw) {
+    await new Promise((r) => setTimeout(r, 800 + Math.floor(Math.random() * 700)));
     return bad(res, 401, 'wrong password');
   }
-  delete guard[ip];
-  writeJsonFile(LOGIN_GUARD_FILE, guard);
+  const g2 = readJsonFile(LOGIN_GUARD_FILE, {});
+  delete g2[ip];
+  writeJsonFile(LOGIN_GUARD_FILE, g2);
   const token = require('crypto').randomBytes(32).toString('hex');
   const sessions = readJsonFile(SESSIONS_FILE, {});
   for (const [t, exp] of Object.entries(sessions)) if (now > exp) delete sessions[t];
   sessions[token] = now + SESSION_TTL_MS;
   writeJsonFile(SESSIONS_FILE, sessions);
-  res.setHeader('Set-Cookie', `mch_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
+  const secure = (req.headers['x-forwarded-proto'] || '').includes('https') ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `mch_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure}`);
   console.log(`dashboard login: ${ip} logged in`);
   res.json({ ok: true });
 });
@@ -138,7 +146,6 @@ app.post('/api/logout', (req, res) => {
   res.setHeader('Set-Cookie', 'mch_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
   res.json({ ok: true });
 });
-
 
 // First-run setup only. Keep a fresh instance private until it is configured.
 app.post('/api/setup', (req, res) => {
@@ -169,10 +176,10 @@ app.get('/api/auth-check', (req, res) => {
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next();
   if (req.method === 'GET' && PUBLIC_API.has(req.path)) return next();
-  if (req.path === '/api/login' || req.path === '/api/logout' || req.path === '/api/setup') return next();
+  if (req.path === '/api/login' || req.path === '/api/logout') return next();
   if (sessionTokenFrom(req)) return next();
   // service-to-service only: pulse's revival trigger uses the shared token
-  if (req.path === '/api/revive-key' && DASH_TOKEN && (req.headers.authorization || '') === `Bearer ${DASH_TOKEN}`) return next();
+  if (req.path === '/api/revive-key' && DASH_TOKEN && safeEq(req.headers.authorization || '', `Bearer ${DASH_TOKEN}`)) return next();
   bad(res, 401, 'auth required');
 });
 
@@ -243,7 +250,6 @@ app.get('/api/status', (_req, res) => {
     running: isRunning(),
     loginPending,
     version: VERSION,
-    log: tail(path.join(LOGS, 'entrypoint.log'), 30),
   });
 });
 
@@ -265,12 +271,14 @@ app.post('/api/chat', (req, res) => {
   const msg = typeof req.body?.msg === 'string' ? req.body.msg.trim() : '';
   if (!msg) return bad(res, 400, 'msg required');
   if (msg.length > 256) return bad(res, 400, 'msg max 256 chars');
+  if (/[\r\n\0]/.test(msg)) return bad(res, 400, 'msg must be one line');
   appendCmd(`msg ${msg}`);
   hmc(`msg ${msg}`);
   res.json({ ok: true });
 });
 
-const SCRIPT_ALLOW = new Set(['afk', 'telemetry']);
+const SCRIPT_ALLOW = new Set(['afk', 'grinder', 'telemetry']);
+const AFK_GROUP = ['afk', 'grinder']; // only one AFK-style script autoruns at a time
 app.post('/api/script', (req, res) => {
   const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
   const action = req.body?.action === undefined ? 'start' : req.body.action;
@@ -279,7 +287,8 @@ app.post('/api/script', (req, res) => {
   if (!SCRIPT_ALLOW.has(name)) return bad(res, 400, 'script not allowed');
 
   const cfgPath = path.join(GDIR, 'minescript', 'config.txt');
-  const autorunLine = `autorun[*]=${name}`;
+  const autorunLine = `autorun[*]=\\${name}`;
+  const legacyLine = `autorun[*]=${name}`;
 
   if (action === 'start') {
     if (!fs.existsSync(path.join(GDIR, 'minescript', `${name}.py`)))
@@ -301,21 +310,32 @@ app.post('/api/script', (req, res) => {
       return bad(res, 500, 'Failed to write minescript config');
     }
 
+    // AFK-style scripts are mutually exclusive: drop the others' autorun lines.
+    if (AFK_GROUP.includes(name)) {
+      try {
+        const cur = fs.readFileSync(cfgPath, 'utf8').split('\n');
+        const keep = cur.filter((l) => !AFK_GROUP.some((o) => o !== name && (l === `autorun[*]=\\${o}` || l === `autorun[*]=${o}`)));
+        fs.writeFileSync(cfgPath, keep.join('\n'));
+      } catch (e) { console.error(e); }
+    }
     appendCmd(`run ${name}`);
     hmc('msg \\' + name);
 
-    // Rejoin now so autorun takes effect immediately (chat-send is broken on 1.21.11).
-    const { host, port, target } = readTarget();
+    // Rejoin only toward an EXPLICIT server.target (never the donutsmp.net default), one pending timer.
+    let explicit = null;
+    try { const m = fs.readFileSync(SERVER_TARGET, 'utf8').trim().match(/^([A-Za-z0-9.-]+):(\d+)$/); if (m) explicit = { host: m[1], port: Number(m[2]), target: m[0] }; } catch {}
+    if (!explicit) return res.json({ ok: true, script: name, action: 'start', rejoin: false, note: 'No server chosen yet; the script runs on your next join.' });
     hmc('disconnect');
-    setTimeout(() => hmc(`connect ${host} ${port}`), 8000);
-    return res.json({ ok: true, script: name, action: 'start', target });
+    if (global.__rejoinTimer) clearTimeout(global.__rejoinTimer);
+    global.__rejoinTimer = setTimeout(() => { global.__rejoinTimer = null; hmc(`connect ${explicit.host} ${explicit.port}`); }, 8000);
+    return res.json({ ok: true, script: name, action: 'start', target: explicit.target });
   }
 
   // stop: drop the autorun line, then disconnect so the running job dies.
   try {
     if (fs.existsSync(cfgPath)) {
       const txt = fs.readFileSync(cfgPath, 'utf8');
-      const lines = txt.split('\n').filter((l) => l !== autorunLine);
+      const lines = txt.split('\n').filter((l) => l !== autorunLine && l !== legacyLine);
       fs.writeFileSync(cfgPath, lines.join('\n'));
     }
   } catch (e) {
@@ -554,11 +574,115 @@ app.post('/api/revive-key', (req, res) => {
   res.status(202).json({ ok: true, id, target, eta_sec: Math.round(preDelay / 1000) + 300 });
 });
 
+
+// --- Session health + in-UI re-login (Microsoft device code) ---
+const HMC_JAR = (() => {
+  try {
+    const f = fs.readdirSync('/headlessmc').filter((x) => /^headlessmc-launcher-wrapper.*\.jar$/.test(x)).sort()[0];
+    return f ? path.join('/headlessmc', f) : '';
+  } catch { return ''; }
+})();
+const LOGIN_LOG = path.join(LOGS, 'login.log');
+let relogin = { state: 'idle', startedAt: 0, finishedAt: 0, error: null, proc: null };
+
+function sessionInvalid() {
+  const t = tail(path.join(GDIR, 'logs', 'latest.log'), 400);
+  const lines = t.split('\n');
+  let last = -1;
+  lines.forEach((l, i) => { if (/invalid session|401.*(profile|key ?pair)|InsufficientPrivileges|Failed to fetch profile key pair/i.test(l)) last = i; });
+  if (last < 0) return false;
+  // a later successful join clears it
+  return !lines.slice(last + 1).some((l) => /Connecting to |Joined|Starting integrated|Loaded \d+ advancements|logged in with entity id/i.test(l));
+}
+
+app.get('/api/session', (_req, res) => {
+  let code = null;
+  if (relogin.state === 'waiting') {
+    const raw = tail(LOGIN_LOG, 50);
+    const uri = raw.match(/https?:\/\/[^\s]*microsoft\.com\/link[^\s]*/i);
+    const c = uri && uri[0].match(/otc=([A-Z0-9]{6,10})/i);
+    if (uri) {
+      const base = uri[0].replace(/[?&]otc=.*$/i, '');
+      code = { code: c ? c[1] : null, url: base, fullUrl: uri[0] };
+    }
+  }
+  res.json({
+    loginDone: fs.existsSync(LOGIN_DONE),
+    invalid: sessionInvalid(),
+    relogin: { state: relogin.state, startedAt: relogin.startedAt, finishedAt: relogin.finishedAt, error: relogin.error },
+    code,
+  });
+});
+
+app.post('/api/relogin', (_req, res) => {
+  if (!HMC_JAR) return bad(res, 500, 'HeadlessMC launcher not found');
+  if (relogin.state === 'waiting' || relogin.state === 'restarting') return res.json({ ok: true, state: relogin.state });
+  const prevDone = fs.existsSync(LOGIN_DONE);
+  try { fs.unlinkSync(LOGIN_DONE); } catch {}
+  try { if (fs.existsSync(LOGIN_LOG)) fs.renameSync(LOGIN_LOG, LOGIN_LOG + '.old'); } catch {}
+  let out;
+  try { out = fs.openSync(LOGIN_LOG, 'w'); } catch (e) { return bad(res, 500, 'cannot open login log'); }
+  const { spawn } = require('child_process');
+  const p = spawn('java', ['-jar', HMC_JAR, '--command', 'login'], { cwd: HMC_HOME, stdio: ['ignore', out, out], detached: false });
+  const mine = { state: 'waiting', startedAt: Date.now(), finishedAt: 0, error: null, proc: p, prevDone };
+  relogin = mine;
+  appendCmd('relogin started');
+  const timer = setTimeout(() => { try { p.kill(); } catch {} }, 12 * 60 * 1000);
+  p.on('exit', (code) => {
+    clearTimeout(timer);
+    if (relogin !== mine) return; // stale exit from a cancelled/replaced attempt
+    const ok = code === 0 && /success/i.test(tail(LOGIN_LOG, 50));
+    if (ok) {
+      try { fs.writeFileSync(LOGIN_DONE, ''); } catch {}
+      mine.state = 'restarting';
+      mine.finishedAt = Date.now();
+      appendCmd('relogin ok -> restarting client');
+      // Kill the game JVM; the entrypoint loop relaunches it with the fresh session.
+      exec("pkill -f '[l]aunch fabric' || true", () => {});
+      setTimeout(() => { if (mine.state === 'restarting') mine.state = 'done'; }, 90 * 1000);
+    } else {
+      if (mine.prevDone && mine.state !== 'idle') { try { fs.writeFileSync(LOGIN_DONE, ''); } catch {} }
+      if (mine.state !== 'idle') mine.state = 'failed';
+      mine.finishedAt = Date.now();
+      mine.error = code === null ? 'Timed out waiting for the code to be entered' : 'Login did not complete';
+    }
+    mine.proc = null;
+  });
+  res.json({ ok: true, state: 'waiting' });
+});
+
+app.post('/api/relogin/cancel', (_req, res) => {
+  relogin.state = 'idle';
+  if (relogin.proc) { try { relogin.proc.kill(); } catch {} }
+  if (relogin.prevDone) { try { fs.writeFileSync(LOGIN_DONE, ''); } catch {} }
+  res.json({ ok: true });
+});
+
+// --- AFK scripts: list with installed/active state ---
+const SCRIPT_META = {
+  afk: { title: 'DonutSMP AFK', desc: 'Looks straight up, sneaks, holds attack and use. Keeps the axe mining while you are away.' },
+  grinder: { title: 'Mob grinder AFK', desc: 'Stands at an XP grinder and swings the sword only when the cooldown is full. Eats from the offhand when hungry.' },
+};
+app.get('/api/scripts', (_req, res) => {
+  let cfg = '';
+  try { cfg = fs.readFileSync(path.join(GDIR, 'minescript', 'config.txt'), 'utf8'); } catch {}
+  const lines = cfg.split('\n').map((l) => l.trim());
+  res.json({
+    scripts: Object.keys(SCRIPT_META).map((name) => ({
+      name, ...SCRIPT_META[name],
+      installed: fs.existsSync(path.join(GDIR, 'minescript', `${name}.py`)),
+      active: lines.includes(`autorun[*]=\\${name}`) || lines.includes(`autorun[*]=${name}`),
+    })),
+  });
+});
+
 // 404 + error handler
 app.use((_req, res) => bad(res, 404, 'Not found'));
 app.use((err, _req, res, _next) => {
+  if (err && err.type === 'entity.parse.failed') return bad(res, 400, 'Invalid JSON');
   console.error(err);
   bad(res, 500, 'Internal error');
 });
 
 app.listen(PORT, () => console.log(`dashboard listening on :${PORT}`));
+

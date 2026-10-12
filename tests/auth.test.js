@@ -40,6 +40,10 @@ test('first-run setup, login, persistence and overwrite protection', async () =>
     await start();
     assert.deepEqual(await (await request('/api/auth-check')).json(), { authed: false, configured: false });
     assert.equal((await request('/api/logs')).status, 401);
+    assert.equal((await request('/api/login-code')).status, 401);
+    const publicStatus = await (await request('/api/status')).json();
+    assert.equal(publicStatus.gameTail, undefined);
+    assert.equal(publicStatus.logTail, undefined);
     assert.equal((await request('/api/setup', { password: 'short' })).status, 400);
     assert.equal((await request('/api/setup', { password: 'x'.repeat(257) })).status, 400);
     assert.equal((await request('/api/setup', { password })).status, 200);
@@ -52,6 +56,12 @@ test('first-run setup, login, persistence and overwrite protection', async () =>
     const cookie = login.headers.get('set-cookie').split(';')[0];
     assert.deepEqual(await (await request('/api/auth-check', undefined, cookie)).json(), { authed: true, configured: true });
     assert.equal((await request('/api/logs', undefined, cookie)).status, 200);
+    assert.equal((await request('/api/chat', { msg: 'hello\nstop' }, cookie)).status, 400);
+    assert.equal((await request('/api/chat', { msg: 'hello\rstop' }, cookie)).status, 400);
+    assert.equal(fs.existsSync(path.join(root, 'hmc-cmd.log')), false);
+    const guesses = await Promise.all(Array.from({length: 8}, () => request('/api/login', {password:'invalid-test-value'})));
+    assert.equal(guesses.filter(r => r.status === 429).length, 3);
+    fs.writeFileSync(path.join(root, 'dashboard-login-guard.json'), '{}');
     assert.equal((await request('/api/setup', { password: 'different-password' })).status, 403);
     assert.equal(fs.readFileSync(path.join(root, 'dashboard-password.hash'), 'utf8'), stored);
     await stop();
