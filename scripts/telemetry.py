@@ -1,8 +1,10 @@
 # MineScript telemetry loop.
-# Contract: dashboard scrapes `TELEMETRY {json}` lines from latest.log
+# Contract v2: dashboard scrapes `TELEMETRY {json}` lines from latest.log
 # (/data/.minecraft/logs/latest.log). One flat object per ~2s:
-# {"x","y","z","yaw","pitch","health","inventory":[{"name","count"}...<=12]}.
+# {"v":2,"ts":epoch_s,"session":id,"seq":n,"x","y","z","yaw","pitch","health" (number|null),
+#  "inventory": [{"name","count"}...<=12] | null}. Unknown values are null, never invented.
 import json
+import os
 import time
 
 import minescript
@@ -33,24 +35,46 @@ def item_shape(it):
     return {"name": str(it)[:60], "count": 1}
 
 
+SESSION = "%d-%d" % (int(time.time()), os.getpid())
+
+
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) != float("inf") else None
+
+
+def at(seq, i):
+    try:
+        return num(seq[i])
+    except Exception:
+        return None
+
+
+seq = 0
 while True:
     try:
-        pos = call("player_position") or []
-        orient = call("player_orientation") or []
-        inv = call("player_inventory") or []
-        items = []
-        for it in inv[:12]:
-            try:
-                items.append(item_shape(it))
-            except Exception:
-                items.append({"name": str(it)[:60], "count": 1})
+        pos = call("player_position")
+        orient = call("player_orientation")
+        inv = call("player_inventory")
+        items = None
+        if isinstance(inv, (list, tuple)):
+            items = []
+            for it in inv[:12]:
+                try:
+                    items.append(item_shape(it))
+                except Exception:
+                    items.append({"name": str(it)[:60], "count": 1})
+        seq += 1
         payload = {
-            "x": pos[0] if len(pos) > 0 else 0,
-            "y": pos[1] if len(pos) > 1 else 0,
-            "z": pos[2] if len(pos) > 2 else 0,
-            "yaw": orient[0] if len(orient) > 0 else 0,
-            "pitch": orient[1] if len(orient) > 1 else 0,
-            "health": call("player_health"),
+            "v": 2,
+            "ts": time.time(),
+            "session": SESSION,
+            "seq": seq,
+            "x": at(pos, 0),
+            "y": at(pos, 1),
+            "z": at(pos, 2),
+            "yaw": at(orient, 0),
+            "pitch": at(orient, 1),
+            "health": num(call("player_health")),
             "inventory": items,
         }
         minescript.echo("TELEMETRY " + json.dumps(payload, default=str))

@@ -75,6 +75,7 @@ a{color:var(--acc);text-decoration:none;word-break:break-all}
 .script .t{flex:1}
 .script b{font-weight:600;display:block}
 .script span{color:var(--mute);font-size:13.5px}
+.script em{display:block;font-style:normal;color:var(--faint);font-size:12.5px;margin-top:2px}
 .tog{position:relative;width:46px;height:28px;border-radius:99px;background:rgba(255,255,255,.14);border:0;cursor:pointer;flex:none;transition:background .2s}
 .tog::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:transform .2s}
 .tog.on{background:var(--ok)}
@@ -332,7 +333,8 @@ $('chat-form').onsubmit = async (e) => { e.preventDefault(); const m = $('msg').
 // ---- scripts ----
 async function pollScripts() {
   let d; try { const r = await apiFetch('/api/scripts'); if (!r.ok) return; d = await r.json(); } catch { return; }
-  $('scripts').innerHTML = d.scripts.map((s) => `<div class="script"><div class="t"><b>${esc(s.title)}</b><span>${esc(s.desc)}</span></div><button class="tog ${s.active ? 'on' : ''}" data-s="${esc(s.name)}" data-on="${s.active ? 1 : 0}" ${s.installed ? '' : 'disabled title="Not installed"'} aria-label="${esc(s.title)}"></button></div>`).join('');
+  const state = (s) => s.observed === 'running' ? 'running' : (!s.desired ? '' : (s.observedReason === 'not-joined' || s.observedReason === 'game-stopped') ? 'on, waiting for a join' : 'on, not confirmed running');
+  $('scripts').innerHTML = d.scripts.map((s) => `<div class="script"><div class="t"><b>${esc(s.title)}</b><span>${esc(s.desc)}${state(s) ? ' <em>' + esc(state(s)) + '</em>' : ''}</span></div><button class="tog ${s.desired ? 'on' : ''}" data-s="${esc(s.name)}" data-on="${s.desired ? 1 : 0}" ${s.installed ? '' : 'disabled title="Not installed"'} aria-label="${esc(s.title)}"></button></div>`).join('');
   $('scripts').querySelectorAll('.tog').forEach((b) => b.onclick = async () => {
     const on = b.dataset.on === '1'; b.disabled = true;
     try { await post('/api/script', { name: b.dataset.s, action: on ? 'stop' : 'start' }); toast(on ? 'Stopped, disconnecting' : 'Started, rejoining', true); } catch (e) { toast(e.message); }
@@ -342,14 +344,16 @@ async function pollScripts() {
 
 // ---- telemetry + logs ----
 async function pollTelemetry() {
+  const none = (msg) => { $('telemetry-data').hidden = true; $('telemetry-placeholder').hidden = false; $('telemetry-placeholder').textContent = msg; };
   try {
-    const r = await apiFetch('/api/telemetry'); if (r.status === 401) return;
-    if (!r.ok) throw 0;
+    const r = await apiFetch('/api/telemetry');
+    if (!r.ok) return none('Telemetry unavailable.');
     const d = await r.json();
+    if (d.status !== 'live') return none(d.status === 'stale' ? 'Last reading is ' + d.ageSec + 's old, so it is not shown.' : d.reason === 'not-joined' ? 'Not in a world.' : d.reason === 'no-sample-since-join' ? 'Waiting for the first reading in this world.' : 'Telemetry unavailable (' + (d.reason || 'unknown') + ').');
     $('telemetry-placeholder').hidden = true; $('telemetry-data').hidden = false;
-    for (const k of ['x', 'y', 'z', 'yaw', 'pitch', 'health']) { const v = d[k]; $('t-' + k).textContent = typeof v === 'number' ? (Math.round(v * 10) / 10).toString() : (v ?? '-'); }
-    $('inv').innerHTML = (d.inventory || []).slice(0, 12).map((i) => `<div>${esc(i.name)}<b>${esc(i.count)}</b></div>`).join('');
-  } catch { $('telemetry-data').hidden = true; $('telemetry-placeholder').hidden = false; }
+    for (const k of ['x', 'y', 'z', 'yaw', 'pitch', 'health']) { const v = d[k]; $('t-' + k).textContent = typeof v === 'number' ? (Math.round(v * 10) / 10).toString() : '-'; }
+    $('inv').innerHTML = d.inventory === null ? '<div>inventory unknown</div>' : (d.inventory || []).slice(0, 12).map((i) => `<div>${esc(i.name)}<b>${esc(i.count)}</b></div>`).join('');
+  } catch { none('Telemetry unavailable.'); }
 }
 let logs = {}, curLog = 'game';
 function drawLog() { const v = logs[curLog]; const b = $('logbox'); b.textContent = v && v.length ? v : 'No logs yet'; b.scrollTop = b.scrollHeight; }
