@@ -253,6 +253,47 @@ app.get('/api/status', (_req, res) => {
   });
 });
 
+// Timestamp boundary for this dashboard process; join boundaries come from the game log.
+const transitionAt = Date.now();
+// What the game is observably doing. A stopped process always wins over old log lines.
+// The WHOLE latest.log is scanned (a join marker can scroll out of any tail window) and the
+// result is cached by mtime+size. joinIdx = line index of the last join marker: telemetry and
+// script heartbeats only count when they appear AFTER it, which binds them to the current
+// join/world even across a spontaneous Disconnecting -> Joined (no reuse of an old world's data).
+let gameCache = { key: '', info: null };
+function gameInfo() {
+  if (!isRunning()) return { game: 'stopped', lines: [], joinIdx: -1 };
+  const file = path.join(GDIR, 'logs', 'latest.log');
+  let st;
+  try { st = fs.statSync(file); } catch { return { game: 'menu', lines: [], joinIdx: -1 }; }
+  const key = `${st.mtimeMs}:${st.size}`;
+  if (gameCache.key === key && gameCache.info) return gameCache.info;
+  let lines = [];
+  try { lines = fs.readFileSync(file, 'utf8').split('\n'); } catch {}
+  let game = 'menu', joinIdx = -1;
+  lines.forEach((l, i) => {
+    if (/logged in with entity id|Joined|Loaded \d+ advancements/.test(l)) { game = 'in-world'; joinIdx = i; }
+    else if (/Connecting to /.test(l)) { game = 'connecting'; joinIdx = -1; }
+    else if (/Disconnecting|Stopping worker threads|Stopping!/.test(l)) { game = 'menu'; joinIdx = -1; }
+  });
+  gameCache = { key, info: { game, lines, joinIdx } };
+  return gameCache.info;
+}
+function observedGame() { return gameInfo().game; }
+// Last JSON payload for `marker` that appears after the current join boundary.
+// null = none after the join, undefined = present but not parseable.
+function currentJoinJson(info, marker, accept) {
+  for (let i = info.lines.length - 1; i > info.joinIdx; i--) {
+    const l = info.lines[i];
+    const at = l.indexOf(marker + ' ');
+    if (at < 0) continue;
+    let o; try { o = JSON.parse(l.slice(at + marker.length + 1).trim()); } catch { return undefined; }
+    if (accept && !accept(o)) continue;
+    return o;
+  }
+  return null;
+}
+
 app.get('/api/login-code', (_req, res) => {
   if (fs.existsSync(LOGIN_DONE)) return bad(res, 404, 'Already logged in');
   const raw = tail(path.join(LOGS, 'login.log'), 500);
@@ -425,27 +466,43 @@ app.post('/api/disconnect', (_req, res) => {
   res.json({ ok: true });
 });
 
+// Telemetry contract v2 (scripts/telemetry.py): one JSON object per ~2s with
+// {v:2, ts (epoch s), session, seq, x,y,z,yaw,pitch,health (number|null), inventory (array|null)}.
+// Unknown values are null, never invented. The reader returns an explicit status:
+// live | stale | unavailable (+ reason), so old/previous-session samples never look current.
+const TELEMETRY_FRESH_SEC = 10;
+const isNumOrNull = (v) => v === null || (typeof v === 'number' && Number.isFinite(v));
+function validTelemetry(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
+  if (o.v !== 2 || typeof o.ts !== 'number' || !Number.isFinite(o.ts) || typeof o.session !== 'string' || !o.session) return false;
+  for (const k of ['x', 'y', 'z', 'yaw', 'pitch', 'health']) if (!isNumOrNull(o[k])) return false;
+  if (o.inventory !== null) {
+    if (!Array.isArray(o.inventory) || o.inventory.length > 64) return false;
+    for (const i of o.inventory) if (!i || typeof i.name !== 'string' || typeof i.count !== 'number' || !Number.isFinite(i.count)) return false;
+  }
+  return true;
+}
 app.get('/api/telemetry', (_req, res) => {
-  let logText = '';
-  try {
-    logText = fs.readFileSync(path.join(GDIR, 'logs', 'latest.log'), 'utf8');
-  } catch (e) {
-    if (e.code === 'ENOENT')
-      return bad(res, 404, 'No telemetry yet — join a world and run telemetry script');
-    console.error(e);
-    return bad(res, 500, 'Failed to read latest.log');
+  res.setHeader('Cache-Control', 'no-store');
+  const none = (reason, extra) => res.json({ status: 'unavailable', reason, ...(extra || {}) });
+  const info = gameInfo();
+  if (info.game !== 'in-world') return none('not-joined', { game: info.game });
+  const o = currentJoinJson(info, 'TELEMETRY');
+  if (o === null) return none('no-sample-since-join');
+  if (o === undefined || !validTelemetry(o)) return none('invalid-sample');
+  const age = Date.now() / 1000 - o.ts;
+  if (age < -2) return none('future-timestamp');
+  if (o.ts * 1000 < transitionAt) return none('previous-session', { ageSec: Math.round(age) });
+  const body = { status: age > TELEMETRY_FRESH_SEC ? 'stale' : 'live', ageSec: Math.max(0, Math.round(age)), session: o.session, ts: o.ts };
+  if (body.status === 'live') {
+    for (const k of ['x', 'y', 'z', 'yaw', 'pitch', 'health']) body[k] = o[k];
+    body.inventory = o.inventory === null ? null : o.inventory.slice(0, 12);
+    body.missing = ['x', 'y', 'z', 'yaw', 'pitch', 'health', 'inventory'].filter((k) => body[k] === null);
+    if (['x', 'y', 'z'].every((k) => body[k] === null)) { body.status = 'unavailable'; body.reason = 'no-player-data'; }
+  } else {
+    body.reason = 'sample-too-old';
   }
-  const last = logText.split('\n').filter(Boolean).slice(-200).reverse()
-    .find((l) => l.includes('TELEMETRY '));
-  if (!last)
-    return bad(res, 404, 'No telemetry yet — join a world and run telemetry script');
-  const json = last.slice(last.indexOf('TELEMETRY ') + 'TELEMETRY '.length).trim();
-  try {
-    res.json(JSON.parse(json));
-  } catch (e) {
-    console.error(e);
-    bad(res, 500, 'Failed to parse telemetry');
-  }
+  res.json(body);
 });
 
 
@@ -663,16 +720,32 @@ const SCRIPT_META = {
   afk: { title: 'DonutSMP AFK', desc: 'Looks straight up, sneaks, holds attack and use. Keeps the axe mining while you are away.' },
   grinder: { title: 'Mob grinder AFK', desc: 'Stands at an XP grinder and swings the sword only when the cooldown is full. Eats from the offhand when hungry.' },
 };
+// desired = configured to autorun on join. observed = running only with a fresh SCRIPTBEAT
+// (with a session) logged after the current join; anything else is unknown, never "not running".
+const SCRIPT_BEAT_FRESH_SEC = 25;
+// Only 'running' is a positive observation. Everything else is unknown (no evidence either way).
+function scriptObserved(name, info) {
+  if (info.game !== 'in-world') return { observed: 'unknown', observedReason: info.game === 'stopped' ? 'game-stopped' : 'not-joined' };
+  const o = currentJoinJson(info, 'SCRIPTBEAT', (x) => x && x.name === name);
+  if (o === null) return { observed: 'unknown', observedReason: 'no-heartbeat-since-join' };
+  if (o === undefined || typeof o.session !== 'string' || !o.session || typeof o.ts !== 'number' || !Number.isFinite(o.ts)) return { observed: 'unknown', observedReason: 'invalid-heartbeat' };
+  const age = Date.now() / 1000 - o.ts;
+  if (age > SCRIPT_BEAT_FRESH_SEC || age < -2 || o.ts * 1000 < transitionAt) return { observed: 'unknown', observedReason: 'stale-heartbeat' };
+  return { observed: 'running', observedReason: null, ageSec: Math.max(0, Math.round(age)) };
+}
 app.get('/api/scripts', (_req, res) => {
   let cfg = '';
   try { cfg = fs.readFileSync(path.join(GDIR, 'minescript', 'config.txt'), 'utf8'); } catch {}
   const lines = cfg.split('\n').map((l) => l.trim());
+  const info = gameInfo();
   res.json({
-    scripts: Object.keys(SCRIPT_META).map((name) => ({
-      name, ...SCRIPT_META[name],
-      installed: fs.existsSync(path.join(GDIR, 'minescript', `${name}.py`)),
-      active: lines.includes(`autorun[*]=\\${name}`) || lines.includes(`autorun[*]=${name}`),
-    })),
+    game: info.game,
+    scripts: Object.keys(SCRIPT_META).map((name) => {
+      const installed = fs.existsSync(path.join(GDIR, 'minescript', `${name}.py`));
+      const desired = installed && (lines.includes(`autorun[*]=\\${name}`) || lines.includes(`autorun[*]=${name}`));
+      const ob = scriptObserved(name, info);
+      return { name, ...SCRIPT_META[name], installed, desired, ...ob, active: ob.observed === 'running' };
+    }),
   });
 });
 
