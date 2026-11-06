@@ -284,7 +284,13 @@ const transitionAt = Date.now();
 // Lifecycle log records only: a line must carry the logger prefix "[HH:MM:SS] [Thread/LEVEL]: " and the
 // lifecycle text must START the message. Chat ("[CHAT] <name> ..."), and our own TELEMETRY/SCRIPTBEAT
 // payload lines, never count, so player text or an inventory item name cannot fake a join/disconnect.
-// The exact vanilla line formats are not evidenced in this repo, so matching is deliberately conservative.
+// Evidence (public decompiled client source, 1.21.11; NOT verified for the launched 26.3):
+//  - "Connecting to {host}, {port}": ConnectScreen.connect -> LOGGER.info (github.com/H1lkaaaGD/Minecraft_1.21.11_Source, net/minecraft/client/gui/screens/ConnectScreen.java)
+//  - "Stopping!": Minecraft.stop -> LOGGER.info (github.com/duollectis/minecraft-decompiled-1.21.11, MinecraftClient.java)
+//  - Real client logs show "[HH:MM:SS] [Render thread/INFO]: Connecting to host, 25565" and "...: Stopping!" (e.g. pastebin.com/Th5HSTr4).
+// UNKNOWN (no client-side source or log found): the exact client join message, and any client disconnect message.
+// "logged in with entity id" and "Loaded N advancements" are SERVER-side and are not used. A join marker must be
+// supplied via MC_JOIN_LOG_PATTERN (a regex tested against the message text); unset means a join is never inferred.
 const LOG_PREFIX = /^\[[^\]]*\] \[[^\]]*\/(?:INFO|WARN|ERROR)\](?: \[(?!CHAT\])[^\]]*\])?: /;
 function lifecycleMessage(l) {
   const p = LOG_PREFIX.exec(l);
@@ -293,6 +299,8 @@ function lifecycleMessage(l) {
   if (m.startsWith('[CHAT]') || m.startsWith('TELEMETRY ') || m.startsWith('SCRIPTBEAT ')) return null;
   return m;
 }
+let JOIN_RE = null;
+try { if (process.env.MC_JOIN_LOG_PATTERN) JOIN_RE = new RegExp(process.env.MC_JOIN_LOG_PATTERN); } catch {}
 let gameCache = { key: '', info: null };
 function gameInfo() {
   if (!isRunning()) return { game: 'stopped', lines: [], joinIdx: -1 };
@@ -307,9 +315,9 @@ function gameInfo() {
   lines.forEach((l, i) => {
     const m = lifecycleMessage(l);
     if (m === null) return;
-    if (/^(?:[\w.]+(?:\[[^\]]*\])? logged in with entity id|Joined\b|Loaded \d+ advancements)/.test(m)) { game = 'in-world'; joinIdx = i; }
+    if (JOIN_RE && JOIN_RE.test(m)) { game = 'in-world'; joinIdx = i; }
     else if (/^Connecting to /.test(m)) { game = 'connecting'; joinIdx = -1; }
-    else if (/^(?:Disconnecting|Stopping worker threads|Stopping!)/.test(m)) { game = 'menu'; joinIdx = -1; }
+    else if (/^Stopping!/.test(m)) { game = 'menu'; joinIdx = -1; }
   });
   gameCache = { key, info: { game, lines, joinIdx } };
   return gameCache.info;
@@ -684,7 +692,7 @@ function sessionInvalid() {
   lines.forEach((l, i) => { if (/invalid session|401.*(profile|key ?pair)|InsufficientPrivileges|Failed to fetch profile key pair/i.test(l)) last = i; });
   if (last < 0) return false;
   // a later successful join clears it
-  return !lines.slice(last + 1).some((l) => /Connecting to |Joined|Starting integrated|Loaded \d+ advancements|logged in with entity id/i.test(l));
+  return !lines.slice(last + 1).some((l) => /Connecting to /i.test(l));
 }
 
 app.get('/api/session', (_req, res) => {
