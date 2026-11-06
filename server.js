@@ -281,6 +281,18 @@ const transitionAt = Date.now();
 // result is cached by mtime+size. joinIdx = line index of the last join marker: telemetry and
 // script heartbeats only count when they appear AFTER it, which binds them to the current
 // join/world even across a spontaneous Disconnecting -> Joined (no reuse of an old world's data).
+// Lifecycle log records only: a line must carry the logger prefix "[HH:MM:SS] [Thread/LEVEL]: " and the
+// lifecycle text must START the message. Chat ("[CHAT] <name> ..."), and our own TELEMETRY/SCRIPTBEAT
+// payload lines, never count, so player text or an inventory item name cannot fake a join/disconnect.
+// The exact vanilla line formats are not evidenced in this repo, so matching is deliberately conservative.
+const LOG_PREFIX = /^\[[^\]]*\] \[[^\]]*\/(?:INFO|WARN|ERROR)\](?: \[(?!CHAT\])[^\]]*\])?: /;
+function lifecycleMessage(l) {
+  const p = LOG_PREFIX.exec(l);
+  if (!p) return null;
+  const m = l.slice(p[0].length);
+  if (m.startsWith('[CHAT]') || m.startsWith('TELEMETRY ') || m.startsWith('SCRIPTBEAT ')) return null;
+  return m;
+}
 let gameCache = { key: '', info: null };
 function gameInfo() {
   if (!isRunning()) return { game: 'stopped', lines: [], joinIdx: -1 };
@@ -293,9 +305,11 @@ function gameInfo() {
   try { lines = fs.readFileSync(file, 'utf8').split('\n'); } catch {}
   let game = 'menu', joinIdx = -1;
   lines.forEach((l, i) => {
-    if (/logged in with entity id|Joined|Loaded \d+ advancements/.test(l)) { game = 'in-world'; joinIdx = i; }
-    else if (/Connecting to /.test(l)) { game = 'connecting'; joinIdx = -1; }
-    else if (/Disconnecting|Stopping worker threads|Stopping!/.test(l)) { game = 'menu'; joinIdx = -1; }
+    const m = lifecycleMessage(l);
+    if (m === null) return;
+    if (/^(?:[\w.]+(?:\[[^\]]*\])? logged in with entity id|Joined\b|Loaded \d+ advancements)/.test(m)) { game = 'in-world'; joinIdx = i; }
+    else if (/^Connecting to /.test(m)) { game = 'connecting'; joinIdx = -1; }
+    else if (/^(?:Disconnecting|Stopping worker threads|Stopping!)/.test(m)) { game = 'menu'; joinIdx = -1; }
   });
   gameCache = { key, info: { game, lines, joinIdx } };
   return gameCache.info;
