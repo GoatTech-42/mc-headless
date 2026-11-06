@@ -72,7 +72,7 @@ Health returns a JSON object with `status`, `mc` and `port`. It proves only that
 - **Chat:** queues a launcher `msg` command, with a 256-character maximum. In-game signed-chat compatibility is not established; check the game log rather than relying on the success toast.
 - **Start AFK:** enables a MineScript autorun and disconnects/rejoins after eight seconds. The bundled script looks upward, then holds sneak, attack and use. It is not passive idle and may interact with your world. Use only where allowed.
 - **Stop AFK:** removes that autorun and disconnects to stop the running job. Reconnect manually when ready. Movement Stop does not replace Stop AFK.
-- **Telemetry:** requires the `telemetry.py` script running in a world. Copying it into the image does not start it. The read endpoint returns the latest `TELEMETRY` log record, not a freshness guarantee. Missing data returns 404.
+- **Telemetry:** requires the `telemetry.py` script running in a world. Copying it into the image does not start it. `/api/telemetry` returns an explicit `status`: `live` (newest sample is 10 seconds old or less, with the readings), `stale` (older than that; no readings are returned) or `unavailable` with a `reason` (for example `not-joined`, `no-sample-since-join`, `invalid-sample`, `future-timestamp`, `previous-session`, `no-player-data`). Only samples logged after the latest join marker (lifecycle log lines, not chat) in `latest.log` count, and a stopped game process always reads as unavailable. Values the script could not read are `null`, not zero. `/api/scripts` reports `desired` (autorun configured) separately from `observed` (`running` only with a fresh `SCRIPTBEAT` heartbeat logged after the latest join, otherwise `unknown`); `active` now means observed running.
 
 MineScript scripts are copied from `/app/scripts` into `/data/.minecraft/minescript` on each boot. Image copies overwrite scripts with the same name. `afk` and `telemetry` are the only names accepted by `/api/script`. Starting either script schedules a rejoin; plan for the interruption.
 
@@ -133,7 +133,7 @@ Do not enable or trigger it on someone else's account or on a server that forbid
 | Missing mods or Modrinth warning | Downloads are best-effort and log warnings without stopping boot. Confirm compatible Fabric builds exist for the selected mod filter. |
 | High CPU or loud fans | Check `docker stats`. Keep the two-CPU cap, inspect software rendering/disconnect screens and stop your own container when unused. |
 | Container killed / game repeats every minute | Check Docker's OOM state and launcher logs. Heap size is not total memory. The launcher retries every 60 seconds after game exit. |
-| Telemetry blank or old | A world and working MineScript telemetry job are required. The reader can return an old log record. |
+| Telemetry blank or old | A world and working MineScript telemetry job are required. The endpoint reports `stale` or `unavailable` with a reason instead of showing old readings. |
 | Controls say success but nothing happens | Success means a command was queued. Check HeadlessMC specifics/mods, game state and game log; look is not implemented and mouse key names are unverified. |
 | Login overlay missing after update | Hard reload the dashboard. The shell and auth-check are served without cache. |
 
