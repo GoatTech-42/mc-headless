@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 MC_GAME_VERSION="${MC_GAME_VERSION:-26.3}"
-# mc-headless entrypoint — HeadlessMC fabric:1.21.11 (headless) + MineScript + dashboard sidecar.
+# mc-headless entrypoint — HeadlessMC (version set by VER below, default fabric:26.3; headless) + MineScript + dashboard sidecar.
 #
 # HeadlessMC home = /data (launcher runs with CWD=/data). Game dir = /data/.minecraft. Logs -> /data/logs.
 # LWJGL needs a real display for texture uploads (splash screen) — HeadlessMC's
@@ -134,15 +134,24 @@ log "enforced lean options.txt (maxFps:10, simDistance:3, no particles/shadows/A
 log "hmc home=$HMC_HOME gamedir=$GDIR xmx=$XMX jar=$HMC_JAR"
 
 # --- Download game version + Fabric (once) ---
-if [ ! -d "$HMC_HOME/versions/fabric-1.21.11" ]; then
-  hmc download "$VER" 2>&1 | tee -a "$HMC_HOME/logs/download.log" || true
-else
-  log "version $VER already downloaded"
-fi
+# version_dir <ver>: HeadlessMC stores "fabric:26.3" under versions/fabric-26.3.
+version_dir() { printf '%s/versions/%s' "$HMC_HOME" "${1//:/-}"; }
+# ensure_version <ver>: download only when that version's own directory is missing.
+# BEGIN ensure_version
+ensure_version() {
+  if [ ! -d "$(version_dir "$1")" ]; then
+    hmc download "$1" 2>&1 | tee -a "$HMC_HOME/logs/download.log" || true
+  else
+    log "version $1 already downloaded"
+  fi
+}
+# END ensure_version
+ensure_version "$VER"
 
-# --- Mods: runtime-resolved from Modrinth API for 1.21.11 (no pinned CDN URLs) ---
-# 1.18.2 -> 1.21.11 bump (2026-09-06): DonutSMP requires >= 1.20.2. The old CDN URLs were
-# 1.18.2-pinned and now wrong; resolve newest 1.21.11 Fabric build per project instead.
+# --- Mods: runtime-resolved from Modrinth API for $MC_GAME_VERSION (default 26.3; no pinned CDN URLs) ---
+# History: mods were once pinned CDN URLs for an older game version (2026-09-06 change);
+# now the newest Fabric build matching $MC_GAME_VERSION is resolved per project instead.
+# MC_GAME_VERSION only filters mod downloads; it does not change the launched $VER.
 # modrinth_dl <slug> <label>: query Modrinth API, take files[0], skip if already present.
 # Uses python3 (jq NOT installed). Resolve/parse failure logs + continues (never aborts boot).
 modrinth_dl() {
@@ -282,6 +291,9 @@ fi
 # hmc-cmd.log: dashboard appends live console commands here; the launch below tails it
 # into the game's stdin (HMC launcher reads commands from stdin).
 touch "$HMC_HOME/hmc-cmd.log"
+
+# Version evidence for the dashboard: the launcher version we are about to request.
+printf '%s\n' "$VER" > "$HMC_HOME/launch-version"
 
 attempt=0
 while true; do

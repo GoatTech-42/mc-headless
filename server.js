@@ -8,7 +8,22 @@ const PORT = Number(process.env.PORT) || 3000;
 const HMC_HOME = process.env.HMC_HOME || '/data';
 const LOGS = process.env.MC_LOGS || '/data/logs';
 const GDIR = process.env.MC_GDIR || '/data/.minecraft';
-const VERSION = 'fabric:1.21.11';
+// Version evidence: entrypoint.sh writes the launcher version it resolved to this file
+// just before launching. The dashboard never hardcodes a version. The file records what
+// was *requested* at launch time; it can be stale (e.g. left from an earlier boot), so
+// it is reported as evidence with its timestamp, not as proof the game is running.
+const VERSION_FILE = path.join(HMC_HOME, 'launch-version');
+function readVersionEvidence() {
+  try {
+    const v = fs.readFileSync(VERSION_FILE, 'utf8').trim();
+    if (!v) return { version: 'unknown', source: 'none', note: 'version file empty' };
+    const at = fs.statSync(VERSION_FILE).mtime.toISOString();
+    return { version: v, source: 'entrypoint-launch-file', writtenAt: at,
+      note: 'launcher version requested at last boot; may be stale, not proof the game is running' };
+  } catch {
+    return { version: 'unknown', source: 'none', note: 'no launch-version file (dashboard standalone or game not launched)' };
+  }
+}
 const LOGIN_DONE = path.join(HMC_HOME, 'logs', '.login-done');
 const SERVER_TARGET = path.join(HMC_HOME, 'server.target');
 const HMC_CMD = path.join(HMC_HOME, 'hmc-cmd.log');
@@ -238,10 +253,12 @@ function readTarget() {
 
 // --- routes ---
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', mc: '1.21.11', port: PORT });
+  const ev = readVersionEvidence();
+  res.json({ status: 'ok', mc: ev.version, mcSource: ev.source, port: PORT });
 });
 
 app.get('/api/status', (_req, res) => {
+  const ev = readVersionEvidence();
   let loginPending = true;
   try {
     if (fs.existsSync(LOGIN_DONE)) loginPending = false;
@@ -249,7 +266,10 @@ app.get('/api/status', (_req, res) => {
   res.json({
     running: isRunning(),
     loginPending,
-    version: VERSION,
+    version: ev.version,
+    versionSource: ev.source,
+    versionWrittenAt: ev.writtenAt || null,
+    versionNote: ev.note,
   });
 });
 

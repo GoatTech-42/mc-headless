@@ -13,9 +13,9 @@ This is a self-hosted project, not a hosted service. Each installation has **one
 
 ### Version caveat
 
-The current launcher in `entrypoint.sh` is hardcoded to `fabric:26.3`. The dashboard still reports `fabric:1.21.11`, and some Dockerfile comments mention 1.18.2. These labels are not proof of the running version. Check the game/launcher logs.
+The launched version is set by `VER` in `entrypoint.sh` (currently `fabric:26.3`). Just before launching, the entrypoint writes it to `$HMC_HOME/launch-version`, and the dashboard's `/api/health` and `/api/status` report that file. If the file is missing (dashboard run standalone, or game not yet launched) they report `unknown`. The file records what was requested at last boot, so it can be stale and is not proof the game is running. Check the game/launcher logs. Some Dockerfile text is still unverified about Java compatibility.
 
-`MC_GAME_VERSION` defaults to `26.3` and selects Modrinth downloads only. Setting it to `1.21.11` does **not** switch the launcher. The launcher also checks for an old `fabric-1.21.11` directory before downloading the configured version. Treat version selection and matching Java/mod availability as unresolved compatibility work, not a supported version switch. The image uses an unpinned `latest` base. A successful image build or dashboard health response does not prove the game can launch.
+`MC_GAME_VERSION` defaults to `26.3` and selects Modrinth downloads only. Setting it to `1.21.11` does **not** switch the launcher. The download check now looks for the directory of the version actually launched (`versions/fabric-26.3`). Treat version selection and matching Java/mod availability as unresolved compatibility work, not a supported version switch. The image uses an unpinned `latest` base. A successful image build or dashboard health response does not prove the game can launch.
 
 ## Install your own instance
 

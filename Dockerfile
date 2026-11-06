@@ -1,7 +1,8 @@
-# mc-headless — headless Minecraft 1.18.2 (Fabric) + MineScript 3.2 + dashboard sidecar
+# mc-headless — headless Minecraft (Fabric; launched version is set by VER in entrypoint.sh) + MineScript 3.2 + dashboard sidecar
 #
 # Base image already ships Java 8/17/21 and the `hmc` CLI (wrapper jar lives in /headlessmc).
-# MC 1.18.2 runs on Java 17 (bundled at /opt/java/java17).
+# The Dockerfile itself installs no Java; entrypoint.sh points HeadlessMC at the base image's
+# Java 17/8/openjdk paths (hmc.java.versions). Whether a given game version runs on them is not verified here.
 FROM 3arthqu4ke/headlessmc:latest
 
 ENV DEBIAN_FRONTEND=noninteractive \
