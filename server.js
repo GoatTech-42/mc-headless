@@ -20,7 +20,8 @@ function readVersionEvidence() {
     const at = fs.statSync(VERSION_FILE).mtime.toISOString();
     return { version: v, source: 'entrypoint-launch-file', writtenAt: at,
       note: 'launcher version requested at last boot; may be stale, not proof the game is running' };
-  } catch {
+  } catch (e) {
+    if (e && e.code !== 'ENOENT') return { version: 'unknown', source: 'none', note: 'launch-version file unreadable' };
     return { version: 'unknown', source: 'none', note: 'no launch-version file (dashboard standalone or game not launched)' };
   }
 }
@@ -254,7 +255,7 @@ function readTarget() {
 // --- routes ---
 app.get('/api/health', (_req, res) => {
   const ev = readVersionEvidence();
-  res.json({ status: 'ok', mc: ev.version, mcSource: ev.source, port: PORT });
+  res.json({ status: 'ok', mc: ev.version, mcSource: ev.source, mcWrittenAt: ev.writtenAt || null, mcNote: ev.note, port: PORT });
 });
 
 app.get('/api/status', (_req, res) => {

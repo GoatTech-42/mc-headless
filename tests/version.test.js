@@ -104,3 +104,40 @@ test('old fabric-1.21.11 dir does NOT suppress the 26.3 download', () => {
   const out = runEnsure(tmp(), VER, 'fabric-1.21.11');
   assert.match(out, /STUB-HMC download fabric:26\.3/);
 });
+
+test('health: file absent -> unknown with note, no writtenAt', async () => {
+  await withDashboard(tmp(), async get => {
+    const h = await get('/api/health');
+    assert.equal(h.mc, 'unknown'); assert.equal(h.mcSource, 'none');
+    assert.equal(h.mcWrittenAt, null); assert.match(h.mcNote, /no launch-version file/);
+  });
+});
+
+test('health: stale file -> version carries writtenAt and may-be-stale note', async () => {
+  const home = tmp(); const f = path.join(home, 'launch-version');
+  fs.writeFileSync(f, 'fabric:26.3\n');
+  const old = new Date('2019-12-31T16:00:00-08:00'); fs.utimesSync(f, old, old);
+  await withDashboard(home, async get => {
+    const h = await get('/api/health');
+    assert.equal(h.mc, 'fabric:26.3'); assert.equal(h.mcWrittenAt, old.toISOString());
+    assert.match(h.mcNote, /may be stale/);
+  });
+});
+
+test('health: unreadable launch-version (is a directory) -> unknown, caveated, no crash', async () => {
+  const home = tmp(); fs.mkdirSync(path.join(home, 'launch-version'));
+  await withDashboard(home, async get => {
+    const h = await get('/api/health'); const s = await get('/api/status');
+    assert.equal(h.mc, 'unknown'); assert.match(h.mcNote, /unreadable/);
+    assert.equal(s.version, 'unknown'); assert.match(s.versionNote, /unreadable/);
+  });
+});
+
+test('empty launch-version -> unknown with note on both endpoints', async () => {
+  const home = tmp(); fs.writeFileSync(path.join(home, 'launch-version'), '\n');
+  await withDashboard(home, async get => {
+    const h = await get('/api/health'); const s = await get('/api/status');
+    assert.equal(h.mc, 'unknown'); assert.match(h.mcNote, /empty/);
+    assert.equal(s.version, 'unknown');
+  });
+});
