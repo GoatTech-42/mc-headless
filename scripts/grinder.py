@@ -1,8 +1,24 @@
 # AFK mob-grinder script (Minescript). Swings only when the sword cooldown is full,
 # eats from the offhand now and then. Runs inside the logged-in HeadlessMC client.
+import json
+import os
 import minescript
 import time
 import math
+
+
+SESSION = "%d-%d" % (int(time.time()), os.getpid())
+_last_beat = [0.0]
+
+
+def beat(name):
+    # Observed-activity heartbeat: the dashboard calls a script "running" only on a fresh beat.
+    try:
+        if time.time() - _last_beat[0] >= 10:
+            _last_beat[0] = time.time()
+            minescript.echo("SCRIPTBEAT " + json.dumps({"name": name, "session": SESSION, "ts": time.time()}))
+    except Exception:
+        pass
 
 HOSTILE = (
     "zombie", "skeleton", "creeper", "spider", "cave_spider", "witch", "husk",
@@ -77,6 +93,7 @@ last_hit = 0.0
 last_eat = time.time()
 try:
     while True:
+        beat("grinder")
         now = time.time()
         if now - last_eat >= EAT_EVERY:
             eat()

@@ -1,8 +1,24 @@
 # DonutSMP AFK: look straight up, sneak, hold attack (axe mines) and use. Ctrl-less loop;
 # stop by disconnecting or removing the autorun line from the dashboard.
+import json
+import os
 import minescript
 import time
 import math
+
+
+SESSION = "%d-%d" % (int(time.time()), os.getpid())
+_last_beat = [0.0]
+
+
+def beat(name):
+    # Observed-activity heartbeat: the dashboard calls a script "running" only on a fresh beat.
+    try:
+        if time.time() - _last_beat[0] >= 10:
+            _last_beat[0] = time.time()
+            minescript.echo("SCRIPTBEAT " + json.dumps({"name": name, "session": SESSION, "ts": time.time()}))
+    except Exception:
+        pass
 
 yaw, start_pitch = minescript.player_orientation()
 target_pitch = -90
@@ -22,6 +38,7 @@ try:
     time.sleep(0.5)
     minescript.player_press_use(True)
     while True:
+        beat("afk")
         time.sleep(0.1)
 finally:
     for f in (minescript.player_press_use, minescript.player_press_attack, minescript.player_press_sneak):
