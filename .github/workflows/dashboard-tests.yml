@@ -1,0 +1,38 @@
+name: Dashboard tests
+
+# Runs the dashboard's own regression tests (tests/*.test.js).
+# These never launch Minecraft or connect to a server.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dashboard-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is what the Docker image installs; 22 is the current LTS.
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install from lockfile
+        run: npm ci --no-audit --no-fund
+      - name: Run tests
+        run: npm test
